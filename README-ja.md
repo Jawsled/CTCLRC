@@ -7,6 +7,8 @@ CTCLRC は、以下の 2 つのファイルから **LRC 歌詞タイミングフ
 
 本アプリは **CTC Forced Alignment** を利用して、歌詞テキストを正解データとして扱い、各歌詞行のタイムスタンプを推定します。
 
+[Android ユーザー向け](https://github.com/Kdroidwin/CTCLRCdroid)
+
 ---
 
 # エンドユーザー向け
