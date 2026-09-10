@@ -11,6 +11,8 @@ The application uses **CTC Forced Alignment**.
 
 The lyrics text is treated as the ground truth, and the application estimates timestamps for each lyric line.
 
+[For Android user](https://github.com/Kdroidwin/CTCLRCdroid)
+
 ---
 
 ## For End Users
