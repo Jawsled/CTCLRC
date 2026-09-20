@@ -14,6 +14,7 @@ icon_path = "assets/ctclrc.ico" if os.name == "nt" else None
 
 
 for pkg in [
+    "PySide6",
     "torch",
     "torchcodec",
     "transformers",
@@ -21,6 +22,17 @@ for pkg in [
     "ctc_forced_aligner",
     "uroman",
     "unidecode",
+    # ROCm runtime wheels (torch 2.13+rocm): torch loads these dynamically via
+    # rocm_sdk.find_libraries -> importlib.import_module, which PyInstaller
+    # cannot see statically. Without them the frozen app crashes at startup
+    # inside torch/__init__ (_rocm_init). The underscore packages hold the
+    # actual DLLs (amdhip64, hiprtc, ...); the rest is cheap insurance.
+    "rocm_sdk",
+    "rocm_bootstrap",
+    "rocm_sdk_core",
+    "rocm_sdk_libraries",
+    "_rocm_sdk_core",
+    "_rocm_sdk_libraries",
 ]:
     try:
         d, b, h = collect_all(pkg)

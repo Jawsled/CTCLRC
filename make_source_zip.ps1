@@ -13,8 +13,12 @@ New-Item -ItemType Directory -Path $staging | Out-Null
 $files = @(
     "README.md",
     "align.py",
+    "batch_utils.py",
+    "embed_lyrics.py",
+    "lrclib_client.py",
     "lrc_export.py",
     "main.py",
+    "test_features.py",
     "ui.py",
     "requirements.txt",
     "CTCLRC.spec",

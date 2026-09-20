@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=CTCLRC
+Comment=Generate LRC lyric timing files via CTC forced alignment
+Exec=CTCLRC
+Icon=ctclrc
+Type=Application
+Categories=Audio;

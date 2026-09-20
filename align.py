@@ -35,6 +35,42 @@ else:
     torch.set_num_interop_threads(1)
 
 
+def get_device_info() -> dict:
+    """Describe the compute device used for alignment (no model load needed).
+
+    Returns dict with: device ("cuda"/"cpu"), label (short, e.g. "GPU" / "CPU"),
+    detail (e.g. GPU name or CPU thread count), torch_version, cuda_available.
+    """
+    cuda_ok = False
+    try:
+        cuda_ok = bool(torch.cuda.is_available())
+    except Exception:
+        cuda_ok = False
+    try:
+        torch_version = str(torch.__version__)
+    except Exception:
+        torch_version = "unknown"
+    if cuda_ok:
+        try:
+            gpu_name = torch.cuda.get_device_name(0)
+        except Exception:
+            gpu_name = "CUDA device"
+        return {
+            "device": "cuda",
+            "label": "GPU",
+            "detail": gpu_name,
+            "torch_version": torch_version,
+            "cuda_available": True,
+        }
+    return {
+        "device": "cpu",
+        "label": "CPU",
+        "detail": f"{CPU_THREADS} threads (torch {torch_version})",
+        "torch_version": torch_version,
+        "cuda_available": False,
+    }
+
+
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys._MEIPASS)
     APP_DIR = Path(sys.executable).resolve().parent
@@ -137,6 +173,123 @@ def resolve_lyrics_source(
     raise FileNotFoundError(
         "Lyrics were not provided. Supply a lyrics file, paste lyrics text, or place a .txt file next to the audio."
     )
+
+
+def has_lyrics_source(
+    audio_file: str | Path,
+    lyric_file: str | Path | None = None,
+    lyric_text: str | None = None,
+) -> tuple[bool, str]:
+    """Check whether any lyrics source exists for a track, without loading the model.
+
+    Sources (in priority order, mirroring resolve_lyrics_source/generate_lrc):
+    pasted text > explicit lyrics file > .txt next to audio > embedded lyrics.
+    Returns (has_source, description). Used to skip lyric-less tracks instead
+    of aborting a whole batch.
+    """
+    if lyric_text is not None and str(lyric_text).strip():
+        return True, "pasted text"
+    if lyric_file:
+        lyric_path = Path(lyric_file)
+        if lyric_path.is_file():
+            try:
+                if lyric_path.stat().st_size > 0:
+                    return True, f"lyrics file {lyric_path.name}"
+            except OSError:
+                pass
+        return False, f"lyrics file not found: {lyric_file}"
+    audio_path = Path(audio_file)
+    candidate = audio_path.with_suffix(".txt")
+    try:
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return True, f"sibling {candidate.name}"
+    except OSError:
+        pass
+    try:
+        embedded = extract_embedded_lyrics(str(audio_path))
+    except Exception:
+        embedded = None
+    if embedded and str(embedded).strip():
+        return True, "embedded lyrics"
+    return False, "no lyrics (no pasted text, lyrics file, .txt, or embedded lyrics)"
+
+
+def detect_existing_lrc(audio_file: str | Path) -> tuple[bool, str | None]:
+    """Check if a synced LRC file already exists alongside the audio file.
+
+    Returns (has_lrc, lrc_path). The path is absolute so callers can export it."""
+    audio_path = Path(audio_file)
+    candidate = audio_path.with_suffix(".lrc")
+    if candidate.exists() and candidate.is_file():
+        return True, str(candidate.resolve())
+    # Also check _word.lrc (word-level output)
+    candidate2 = audio_path.with_name(audio_path.stem + "_word.lrc")
+    if candidate2.exists() and candidate2.is_file():
+        return True, str(candidate2.resolve())
+    return False, None
+
+
+def extract_embedded_lyrics(audio_file: str | Path) -> str | None:
+    """Extract plain-text lyrics embedded in audio metadata (USLT / LYRICS).
+
+    Handles MP3 (ID3 USLT), MP4/M4A (---lyrics), FLAC/OGG Vorbis (LYRICS tag).
+    Returns the raw text, or None if no embedded lyrics are found.
+
+    This is *unsynced* plain-text lyrics - not LRC timestamps."""
+    audio_path = Path(audio_file)
+    ext = audio_path.suffix.lower()
+
+    # MP3: ID3 USLT frame
+    if ext in (".mp3", ".m3u"):
+        try:
+            from mutagen.id3 import ID3, USLT
+            tags = ID3(str(audio_path))
+            for key, val in tags.items():
+                if isinstance(val, USLT):
+                    return str(val.text)
+        except Exception:
+            pass
+
+    # MP4/M4A: ---lyrics tag
+    if ext in (".m4a", ".mp4"):
+        try:
+            from mutagen.mp4 import MP4
+            tags = MP4(str(audio_path))
+            lyrics_tag = tags.get("\xa9lyr") or tags.get("---lyrics")
+            if lyrics_tag and len(lyrics_tag) > 0:
+                return str(lyrics_tag[0])
+        except Exception:
+            pass
+
+    # FLAC / OGG Vorbis: LYRICS tag
+    if ext in (".flac", ".ogg"):
+        try:
+            from mutagen.flac import FLAC
+            from mutagen.oggvorbis import OggVorbis
+            audio = None
+            if ext == ".flac":
+                audio = FLAC(str(audio_path))
+            else:
+                audio = OggVorbis(str(audio_path))
+            lyrics_tag = audio.get("LYRICS") or audio.get("lyrics")
+            if lyrics_tag and len(lyrics_tag) > 0:
+                return str(lyrics_tag[0])
+        except Exception:
+            pass
+
+    # Fallback: try av container metadata (works for some formats)
+    try:
+        with av.open(str(audio_path), mode="r", metadata_errors="ignore") as container:
+            tags = dict(container.tags) if hasattr(container, "tags") else {}
+        # Some containers store lyrics under keys like 'lyrics', 'unsynced_lyrics'
+        for key in ("lyrics", "unsynced_lyrics", "LYRICS"):
+            val = tags.get(key)
+            if val and str(val).strip():
+                return str(val).strip()
+    except Exception:
+        pass
+
+    return None
 
 
 def decode_audio(audio_path: str) -> np.ndarray:
@@ -441,14 +594,22 @@ def generate_lrc(
     if not audio_file.exists():
         raise FileNotFoundError(audio_file)
 
-    if progress_callback:
-        progress_callback(5)
+    # Feature 2: check for unsynced lyrics embedded in metadata (USLT / LYRICS)
+    embedded_text = extract_embedded_lyrics(str(audio_file))
+    if embedded_text and embedded_text.strip():
+        print("Lyrics: embedded plain-text from audio tags")
+        lyrics, section_breaks = load_lyrics_text(embedded_text, keep_sections=keep_sections)
+        if not lyrics:
+            raise ValueError("Embedded lyrics are empty.")
+        print(f"{len(lyrics)} lyric lines (from metadata)")
+    else:
+        # Standard path: resolve from file or paste
+        print("Load lyrics...")
+        lyrics, section_breaks = resolve_lyrics_source(audio_file, lyric_file, lyric_text, keep_sections=keep_sections)
+        if not lyrics:
+            raise ValueError("Lyrics are empty.")
+        print(f"{len(lyrics)} lyric lines")
 
-    print("Load lyrics...")
-    lyrics, section_breaks = resolve_lyrics_source(audio_file, lyric_file, lyric_text, keep_sections=keep_sections)
-    if not lyrics:
-        raise ValueError("Lyrics are empty.")
-    print(f"{len(lyrics)} lyric lines")
     if progress_callback:
         progress_callback(15)
 
