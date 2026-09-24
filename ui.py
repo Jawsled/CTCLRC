@@ -1,5 +1,5 @@
 from pathlib import Path
-from PySide6.QtCore import QSettings, Qt, QUrl, QTimer, QThread, QObject, Signal, Slot
+from PySide6.QtCore import QSettings, Qt, QUrl, QTimer, QThread, QObject, Signal, Slot, QEvent
 from PySide6.QtWidgets import (
     QWidget,
     QLabel,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
+    QMenu,
     QSlider,
     QFrame,
     QMessageBox,
@@ -105,6 +106,12 @@ STRINGS = {
         "embed_audio": "Embed to Audio",
         "fix_times": "Fix Timestamps",
         "shift_times": "Shift Times",
+        "tap_sync": "Tap-sync",
+        "tap_next": "Tap (Space / T)",
+        "tap_back": "Back",
+        "tap_restart": "Restart",
+        "undo": "Undo",
+        "redo": "Redo",
 }
 
 
@@ -373,6 +380,12 @@ class LyricViewerDialog(QDialog):
         self._timer.timeout.connect(self._on_tick)
         self._duration_ms = 0
         self._is_seeking = False
+        # Tap-sync state: when enabled, existing timestamps are temporarily
+        # ignored for follow/highlight and each tap stamps the next line
+        # with the current playback position (timings are assumed ~correct
+        # from the previous steps, so this is just a quick re-tap pass).
+        self._tap_enabled = False
+        self._tap_index = 0
 
         # try to init QMediaPlayer
         try:
@@ -448,6 +461,45 @@ class LyricViewerDialog(QDialog):
         ctrl.addWidget(self.vol_value_label)
         outer.addLayout(ctrl)
 
+        # Tap-sync row: ON/OFF toggle + tap/back/restart buttons (not a
+        # separate mode — when ON the existing timestamps are temporarily
+        # ignored and each tap re-stamps the next line with the playback
+        # position).
+        _tt = lambda key, fallback: parent.text(key) if parent and hasattr(parent, "text") else fallback
+        tap_row = QHBoxLayout()
+        self.tap_toggle = QPushButton(f"{_tt('tap_sync', 'Tap-sync')}: OFF")
+        self.tap_toggle.setCheckable(True)
+        self.tap_toggle.setChecked(False)
+        self.tap_toggle.setToolTip(
+            "Turn tap-sync ON to re-tap timings line by line. While ON, old timestamps are ignored "
+            "(no auto-follow, no red flags, clicks move the tap cursor instead of seeking). "
+            "Playback starts from the top automatically — then press Space/T or Tap for each line."
+        )
+        self.tap_toggle.setStyleSheet(
+            "QPushButton:checked { background-color: #2e7d32; color: #ffffff; font-weight: bold; }"
+        )
+        self.tap_toggle.toggled.connect(self.set_tap_sync_enabled)
+        tap_row.addWidget(self.tap_toggle)
+        self.btn_tap = QPushButton(_tt("tap_next", "Tap (Space / T)"))
+        self.btn_tap.setToolTip("Stamp the highlighted line with the current playback time and advance (Space / T)")
+        self.btn_tap.setEnabled(False)
+        self.btn_tap.clicked.connect(lambda: self.tap_current_line())
+        tap_row.addWidget(self.btn_tap)
+        self.btn_tap_back = QPushButton(_tt("tap_back", "Back"))
+        self.btn_tap_back.setToolTip("Go back one line without changing any timestamp (Backspace)")
+        self.btn_tap_back.setEnabled(False)
+        self.btn_tap_back.clicked.connect(lambda: self.tap_back_one())
+        tap_row.addWidget(self.btn_tap_back)
+        self.btn_tap_restart = QPushButton(_tt("tap_restart", "Restart"))
+        self.btn_tap_restart.setToolTip("Restart the tap pass: seek to the start and tap again from line 1")
+        self.btn_tap_restart.setEnabled(False)
+        self.btn_tap_restart.clicked.connect(lambda: self.restart_tap_pass())
+        tap_row.addWidget(self.btn_tap_restart)
+        self.tap_hint = QLabel("")
+        self.tap_hint.setStyleSheet("font-size: 11px; color: #aaaaaa; font-style: italic;")
+        tap_row.addWidget(self.tap_hint, 1)
+        outer.addLayout(tap_row)
+
         # Timeline / Table: Time | Lyric (standard LRC format, dark mode theme)
         self.table = QTableWidget(0, 2)
         _t = lambda key, fallback: parent.text(key) if parent and hasattr(parent, "text") else fallback
@@ -459,7 +511,7 @@ class LyricViewerDialog(QDialog):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed | QAbstractItemView.AnyKeyPressed)
         self.table.setAlternatingRowColors(False)
-        self.table.setToolTip("Red row = timestamp out of order (use Fix Timestamps)")
+        self.table.setToolTip("Blue row = currently playing line  •  Red row = timestamp out of order (use Fix Timestamps)")
         # Dark grey (dark mode) table: matches app-wide DARK_GREY theme.
         self.table.setStyleSheet("""
             QTableWidget {
@@ -521,13 +573,41 @@ class LyricViewerDialog(QDialog):
         self.table.itemSelectionChanged.connect(self._on_table_select)
         self.table.itemClicked.connect(self._on_item_clicked)
         self._invalid_rows: set[int] = set()
+        # Table-level undo/redo (snapshots). The in-cell editor keeps its
+        # own per-keystroke undo; these stacks cover committed table edits
+        # (manual edits, add/remove, fix, shift, taps, file loads).
+        self._undo_stack: list[list[tuple[str, str]]] = []
+        self._redo_stack: list[list[tuple[str, str]]] = []
+        self._table_baseline: list[tuple[str, str]] | None = None
+        self._undo_suspended = False
+        self._undo_limit = 200
         self.table.itemChanged.connect(self._on_table_time_edited)
+        # Right-click menu: Undo/Redo + row actions
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_table_context_menu)
+        # Intercept tap-mode keys at the table level too (see eventFilter):
+        # the view may accept Space before it reaches keyPressEvent.
+        try:
+            self.table.installEventFilter(self)
+            self.table.viewport().installEventFilter(self)
+        except Exception:
+            pass
         # Double-click edits, single-click jumps - keep edit on double click only
         self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         outer.addWidget(self.table, 1)
 
         # Bottom row: add/remove/save
         bottom = QHBoxLayout()
+        self.btn_undo = QPushButton(parent.text("undo") if parent and hasattr(parent, "text") else "Undo")
+        self.btn_undo.setToolTip("Undo last table edit (Ctrl+Z)")
+        self.btn_undo.setEnabled(False)
+        self.btn_undo.clicked.connect(lambda: self.undo_table_edit())
+        bottom.addWidget(self.btn_undo)
+        self.btn_redo = QPushButton(parent.text("redo") if parent and hasattr(parent, "text") else "Redo")
+        self.btn_redo.setToolTip("Redo (Ctrl+Y / Ctrl+Shift+Z)")
+        self.btn_redo.setEnabled(False)
+        self.btn_redo.clicked.connect(lambda: self.redo_table_edit())
+        bottom.addWidget(self.btn_redo)
         self.btn_add = QPushButton(parent.text("add_row") if parent and hasattr(parent, "text") else "Add row")
         self.btn_add.clicked.connect(self.add_row)
         bottom.addWidget(self.btn_add)
@@ -607,6 +687,10 @@ class LyricViewerDialog(QDialog):
 
     def load_lines(self, lines: list[dict]):
         from PySide6.QtGui import QBrush, QColor
+        if not getattr(self, "_undo_suspended", False) and getattr(self, "_table_baseline", None) is not None:
+            # Full reloads (file/drop/txt) are undoable, except the very
+            # first load during __init__ (baseline still None).
+            self._push_undo()
         self.table.blockSignals(True)
         self.table.setRowCount(0)
         for item in lines:
@@ -621,7 +705,14 @@ class LyricViewerDialog(QDialog):
             l_item.setForeground(QBrush(QColor("#e6e6e6")))
             self.table.setItem(row, 1, l_item)
         self.table.blockSignals(False)
-        self._refresh_row_marking()
+        self._followed_row = None
+        self._table_baseline = self._table_snapshot()
+        self._update_undo_buttons()
+        if getattr(self, "_tap_enabled", False):
+            self._tap_index = 0
+            self._update_tap_ui()
+        else:
+            self._refresh_row_marking()
 
     def collect_lines(self) -> list[dict]:
         out = []
@@ -678,6 +769,11 @@ class LyricViewerDialog(QDialog):
             self._player.setPosition(0)
             self.btn_play.setText(self.parent().text("play") if self.parent() and hasattr(self.parent(), "text") else "Play")
             self._timer.stop()
+        try:
+            self.table.clearSelection()
+        except Exception:
+            pass
+        self._followed_row = None
 
     def _stop_playback(self):
         """Silently stop audio + timer and release the file (used on close)."""
@@ -717,6 +813,43 @@ class LyricViewerDialog(QDialog):
         self._duration_ms = d
         self._update_time_label(self._player.position() if self._player else 0, d)
 
+    def _is_playing(self) -> bool:
+        try:
+            return (self._player is not None
+                    and self._player.playbackState() == self._player.PlaybackState.PlayingState)
+        except Exception:
+            return False
+
+    def _follow_position(self, sec: float) -> None:
+        """Select the row of the currently playing line (blue selection).
+
+        Display-order scan, last start at/before the position wins. Only
+        re-selects when the row actually changes."""
+        if getattr(self, "_tap_enabled", False):
+            # Tap-sync ON: existing timestamps are temporarily ignored,
+            # selection is driven by taps, not by playback position.
+            return
+        n = self.table.rowCount()
+        if not n:
+            return
+        idx = -1
+        for r in range(n):
+            t_item = self.table.item(r, 0)
+            s = parse_lrc_time(t_item.text()) if t_item and t_item.text().strip() else None
+            if s is None:
+                continue
+            if s <= sec:
+                idx = r
+        if idx != getattr(self, "_followed_row", None):
+            self._followed_row = idx
+            if idx >= 0:
+                self.table.blockSignals(True)
+                try:
+                    self.table.selectRow(idx)
+                finally:
+                    self.table.blockSignals(False)
+                self.table.scrollToItem(self.table.item(idx, 0), QAbstractItemView.PositionAtCenter)
+
     def _on_position_changed(self, pos):
         if not self._is_seeking:
             if self._duration_ms > 0:
@@ -724,6 +857,10 @@ class LyricViewerDialog(QDialog):
                 self.slider.setValue(int(pos / self._duration_ms * 1000))
                 self.slider.blockSignals(False)
             self._update_time_label(pos, self._duration_ms)
+            # Blue follow-selection only while actually playing (or scrubbing),
+            # so nothing lights up on plain audio load.
+            if self._is_playing() or self._is_seeking:
+                self._follow_position(pos / 1000.0)
 
     def _on_tick(self):
         if self._player is None:
@@ -749,9 +886,15 @@ class LyricViewerDialog(QDialog):
             self.vol_value_label.setText(f"{v}%")
 
     def _on_item_clicked(self, item):
-        # Single click = jump to timestamp (double click still edits)
+        # Single click = jump to timestamp (double click still edits).
+        # While tap-sync is ON, old timestamps are ignored: a click only
+        # moves the tap cursor (no seek), so you can re-tap from any line.
         row = item.row() if item else self.table.currentRow()
         if row < 0:
+            return
+        if getattr(self, "_tap_enabled", False):
+            self._tap_index = max(0, min(row, max(0, self.table.rowCount() - 1)))
+            self._update_tap_ui()
             return
         t_item = self.table.item(row, 0)
         if t_item is None:
@@ -791,13 +934,21 @@ class LyricViewerDialog(QDialog):
     def _repaint_rows(self):
         # Paint every row: red background for out-of-sequence rows, plain
         # dark grey otherwise. No playback highlight by design.
+        # While tap-sync is ON, red marking is suppressed and the tap
+        # cursor row gets a yellow background instead.
         from PySide6.QtGui import QBrush, QColor
-        invalid = getattr(self, "_invalid_rows", set())
+        tap_on = getattr(self, "_tap_enabled", False)
+        tap_idx = getattr(self, "_tap_index", 0) if tap_on else -1
+        invalid = getattr(self, "_invalid_rows", set()) if not tap_on else set()
         for r in range(self.table.rowCount()):
             for c in range(self.table.columnCount()):
                 it = self.table.item(r, c)
                 if it:
-                    if r in invalid:
+                    if tap_on and r == tap_idx:
+                        # Tap cursor: yellow background (next line to stamp)
+                        it.setBackground(QBrush(QColor("#6e5a1f")))
+                        it.setForeground(QBrush(QColor("#ffe9a8")))
+                    elif r in invalid:
                         # Out-of-sequence row: flag with a red background
                         it.setBackground(QBrush(QColor("#6e1f1f")))
                         it.setForeground(QBrush(QColor("#ffd7d7")))
@@ -807,9 +958,24 @@ class LyricViewerDialog(QDialog):
                         it.setForeground(QBrush(QColor("#e6e6e6")))
 
     def _on_table_time_edited(self, item):
-        """A timestamp edit committed: refresh red marking only.
+        """A cell edit committed: record it for undo, refresh red marking.
 
-        Never touches times here — correction is manual via fix_timestamps()."""
+        Never touches times here — correction is manual via fix_timestamps().
+        (Covers both columns: time edits refresh marking, lyric edits just
+        become undoable.)"""
+        if getattr(self, "_undo_suspended", False):
+            return
+        try:
+            snap = self._table_snapshot()
+            if snap != getattr(self, "_table_baseline", None):
+                # Committed user edit: the pre-edit baseline is the undo step
+                self._undo_stack.append(list(getattr(self, "_table_baseline", None) or []))
+                del self._undo_stack[:-getattr(self, "_undo_limit", 200)]
+                self._redo_stack.clear()
+                self._table_baseline = snap
+                self._update_undo_buttons()
+        except Exception:
+            pass
         try:
             if item.column() != 0:
                 return
@@ -836,6 +1002,424 @@ class LyricViewerDialog(QDialog):
         self._invalid_rows = invalid
         self._repaint_rows()
 
+    # --- table-level undo / redo (Ctrl+Z / Ctrl+Y) ---
+    def _table_snapshot(self) -> list[tuple[str, str]]:
+        """Raw cell texts, row by row — restorable exactly (incl. invalid)."""
+        snap: list[tuple[str, str]] = []
+        try:
+            for r in range(self.table.rowCount()):
+                t = self.table.item(r, 0)
+                li = self.table.item(r, 1)
+                snap.append((t.text() if t else "", li.text() if li else ""))
+        except Exception:
+            pass
+        return snap
+
+    def _push_undo(self) -> list[list[tuple[str, str]]]:
+        """Record the pre-mutation baseline; clears the redo stack.
+
+        Returns the previous redo stack so no-op mutations can restore it.
+        """
+        redo_backup = list(getattr(self, "_redo_stack", None) or [])
+        try:
+            self._undo_stack.append(list(getattr(self, "_table_baseline", None) or []))
+            del self._undo_stack[:-getattr(self, "_undo_limit", 200)]
+            self._redo_stack.clear()
+            self._update_undo_buttons()
+        except Exception:
+            pass
+        return redo_backup
+
+    def _update_undo_buttons(self) -> None:
+        try:
+            if hasattr(self, "btn_undo"):
+                self.btn_undo.setEnabled(bool(getattr(self, "_undo_stack", None)))
+            if hasattr(self, "btn_redo"):
+                self.btn_redo.setEnabled(bool(getattr(self, "_redo_stack", None)))
+        except Exception:
+            pass
+
+    def _finish_table_mutation(self, before: list[tuple[str, str]], redo_backup=None) -> None:
+        """Commit a programmatic mutation, or drop the push if no-op.
+
+        A no-op also restores the redo stack (nothing actually changed).
+        """
+        try:
+            after = self._table_snapshot()
+            if after == before:
+                if getattr(self, "_undo_stack", None):
+                    self._undo_stack.pop()
+                if redo_backup is not None:
+                    self._redo_stack = list(redo_backup)
+            else:
+                self._table_baseline = after
+            self._update_undo_buttons()
+        except Exception:
+            pass
+        if getattr(self, "_tap_enabled", False):
+            n = self.table.rowCount()
+            self._tap_index = max(0, min(getattr(self, "_tap_index", 0), max(0, n - 1) if n else 0))
+            self._update_tap_ui()
+        else:
+            self._refresh_row_marking()
+
+    def _restore_snapshot(self, snap: list[tuple[str, str]]) -> None:
+        """Replace the table content with a snapshot (undo/redo internals)."""
+        from PySide6.QtGui import QBrush, QColor
+        self._undo_suspended = True
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(0)
+            for t_text, l_text in snap:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                t_item = QTableWidgetItem(t_text)
+                t_item.setTextAlignment(Qt.AlignCenter)
+                t_item.setForeground(QBrush(QColor("#e6e6e6")))
+                self.table.setItem(row, 0, t_item)
+                l_item = QTableWidgetItem(l_text)
+                l_item.setForeground(QBrush(QColor("#e6e6e6")))
+                self.table.setItem(row, 1, l_item)
+        finally:
+            self.table.blockSignals(False)
+            self._undo_suspended = False
+        self._followed_row = None
+        self._table_baseline = list(snap)
+        self._update_undo_buttons()
+        if getattr(self, "_tap_enabled", False):
+            n = self.table.rowCount()
+            self._tap_index = max(0, min(getattr(self, "_tap_index", 0), max(0, n - 1) if n else 0))
+            self._update_tap_ui()
+        else:
+            self._refresh_row_marking()
+
+    def _is_cell_editing(self) -> bool:
+        """True while the in-cell editor is open (its own Ctrl+Z applies).
+
+        The focus-widget part additionally requires visibility: after an
+        editor closes, a hidden (not yet destroyed) editor must not count,
+        otherwise table-level undo would stay blocked.
+        """
+        try:
+            from PySide6.QtWidgets import QLineEdit
+            if self.table.state() == QAbstractItemView.EditingState:
+                return True
+            fw = self.focusWidget()
+            return isinstance(fw, QLineEdit) and fw.isVisible()
+        except Exception:
+            return False
+
+    def undo_table_edit(self) -> bool:
+        """Undo the last committed table edit. Returns True if applied."""
+        if self._is_cell_editing():
+            return False  # let the in-cell editor handle its own undo
+        if not getattr(self, "_undo_stack", None):
+            return False
+        try:
+            self._redo_stack.append(self._table_snapshot())
+            snap = self._undo_stack.pop()
+            self._restore_snapshot(snap)
+            return True
+        except Exception:
+            return False
+
+    def redo_table_edit(self) -> bool:
+        """Re-apply an undone table edit. Returns True if applied."""
+        if self._is_cell_editing():
+            return False  # let the in-cell editor handle its own redo
+        if not getattr(self, "_redo_stack", None):
+            return False
+        try:
+            self._undo_stack.append(self._table_snapshot())
+            del self._undo_stack[:-getattr(self, "_undo_limit", 200)]
+            snap = self._redo_stack.pop()
+            self._restore_snapshot(snap)
+            return True
+        except Exception:
+            return False
+
+    def _show_table_context_menu(self, pos) -> None:
+        menu = QMenu(self)
+        act_undo = menu.addAction("Undo (Ctrl+Z)")
+        act_undo.setEnabled(bool(getattr(self, "_undo_stack", None)))
+        act_redo = menu.addAction("Redo (Ctrl+Y)")
+        act_redo.setEnabled(bool(getattr(self, "_redo_stack", None)))
+        menu.addSeparator()
+        act_add = menu.addAction("Add row")
+        act_del = menu.addAction("Remove selected row(s)")
+        act_fix = menu.addAction("Fix timestamps")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen == act_undo:
+            self.undo_table_edit()
+        elif chosen == act_redo:
+            self.redo_table_edit()
+        elif chosen == act_add:
+            self.add_row()
+        elif chosen == act_del:
+            self.remove_selected_rows()
+        elif chosen == act_fix:
+            self.fix_timestamps()
+
+    # --- tap-sync (re-tap timings line by line, old times ignored) ---
+    def set_tap_sync_enabled(self, on: bool) -> None:
+        """Enable/disable tap-sync.
+
+        Not a separate mode: the table stays as-is, but while ON the old
+        timestamps are temporarily ignored (no follow, no red flags,
+        clicks move the tap cursor instead of seeking). Each tap overwrites
+        one row; untapped rows keep their old time until tapped. Turning
+        OFF keeps all tapped times and re-enables normal validation.
+        Turning ON also starts playback from the top so tapping can begin
+        immediately.
+        """
+        on = bool(on)
+        self._tap_enabled = on
+        if on:
+            self._tap_index = 0
+            self._followed_row = None
+        if hasattr(self, "btn_tap"):
+            self.btn_tap.setEnabled(on and self.table.rowCount() > 0)
+        if hasattr(self, "btn_tap_back"):
+            self.btn_tap_back.setEnabled(on)
+        if hasattr(self, "btn_tap_restart"):
+            self.btn_tap_restart.setEnabled(on)
+        if hasattr(self, "tap_toggle"):
+            if self.tap_toggle.isChecked() != on:
+                self.tap_toggle.blockSignals(True)
+                self.tap_toggle.setChecked(on)
+                self.tap_toggle.blockSignals(False)
+            label = "Tap-sync"
+            try:
+                parent = self.parent()
+                if parent is not None and hasattr(parent, "text"):
+                    label = parent.text("tap_sync")
+            except Exception:
+                pass
+            self.tap_toggle.setText(f"{label}: {'ON' if on else 'OFF'}")
+        if on:
+            # Keep Space for tapping: take focus away from buttons so the
+            # key reaches the tap handler instead of triggering a button.
+            try:
+                for b in (self.btn_play, self.btn_stop, self.btn_tap,
+                          self.btn_tap_back, self.btn_tap_restart, self.tap_toggle):
+                    b.setFocusPolicy(Qt.NoFocus)
+                self.table.setFocus()
+            except Exception:
+                pass
+            self._update_tap_ui()
+            self._ensure_tap_playback(from_top=True)
+        else:
+            try:
+                for b in (self.btn_play, self.btn_stop, self.btn_tap,
+                          self.btn_tap_back, self.btn_tap_restart, self.tap_toggle):
+                    b.setFocusPolicy(Qt.StrongFocus)
+            except Exception:
+                pass
+            if hasattr(self, "tap_hint"):
+                self.tap_hint.setText("")
+            self._refresh_row_marking()
+
+    def _ensure_tap_playback(self, from_top: bool = False) -> None:
+        """Start (or resume) playback for a tap pass.
+
+        With from_top=True (enabling tap-sync / Restart), seeks to the
+        start first when stopped at position 0 or sitting at the end.
+        Does nothing when already playing or when no audio is loaded.
+        """
+        try:
+            if self._player is None:
+                return
+            if not self.audio_path or not Path(self.audio_path).exists():
+                return
+            if self._is_playing():
+                return
+            if from_top:
+                try:
+                    pos = int(self._player.position())
+                except Exception:
+                    pos = 0
+                try:
+                    dur = int(self._player.duration())
+                except Exception:
+                    dur = 0
+                if pos <= 0 or (dur > 0 and pos >= dur - 300):
+                    try:
+                        self._player.setPosition(0)
+                    except Exception:
+                        pass
+            self.toggle_play()
+        except Exception:
+            pass
+
+    def _current_playback_sec(self) -> float:
+        """Current playback position in seconds (0.0 if unknown)."""
+        try:
+            if self._player is not None:
+                return max(0.0, float(self._player.position()) / 1000.0)
+        except Exception:
+            pass
+        return 0.0
+
+    def _update_tap_ui(self) -> None:
+        """Refresh tap cursor selection, hint and button states."""
+        n = self.table.rowCount()
+        idx = max(0, min(getattr(self, "_tap_index", 0), max(0, n - 1) if n else 0))
+        self._tap_index = idx
+        if hasattr(self, "btn_tap"):
+            self.btn_tap.setEnabled(bool(getattr(self, "_tap_enabled", False)) and n > 0 and idx < n)
+        if hasattr(self, "btn_tap_back"):
+            self.btn_tap_back.setEnabled(bool(getattr(self, "_tap_enabled", False)) and idx > 0)
+        if hasattr(self, "btn_tap_restart"):
+            self.btn_tap_restart.setEnabled(bool(getattr(self, "_tap_enabled", False)) and n > 0)
+        if getattr(self, "_tap_enabled", False) and n:
+            if hasattr(self, "tap_hint"):
+                self.tap_hint.setText(f"Tap-sync ON — tap Space/T for line {idx + 1}/{n}")
+            self.table.blockSignals(True)
+            try:
+                self.table.selectRow(idx)
+            finally:
+                self.table.blockSignals(False)
+            try:
+                it = self.table.item(idx, 0)
+                if it is not None:
+                    self.table.scrollToItem(it, QAbstractItemView.PositionAtCenter)
+            except Exception:
+                pass
+        elif hasattr(self, "tap_hint") and getattr(self, "_tap_enabled", False):
+            self.tap_hint.setText("Tap-sync ON — no lines to tap")
+        self._repaint_rows()
+
+    def tap_current_line(self, sec: float | None = None) -> bool:
+        """Stamp the tap-cursor row with the current playback time.
+
+        sec overrides the playback position (used by tests/callers).
+        Enforces monotonicity against the row above. Returns True if a
+        row was stamped.
+        """
+        from PySide6.QtGui import QBrush, QColor
+        if not getattr(self, "_tap_enabled", False):
+            return False
+        n = self.table.rowCount()
+        idx = getattr(self, "_tap_index", 0)
+        if n == 0 or idx >= n:
+            return False
+        if sec is None:
+            sec = self._current_playback_sec()
+        try:
+            sec = max(0.0, float(sec))
+        except Exception:
+            return False
+        # Keep LRC valid: never stamp earlier than the line above + 0.01s
+        if idx > 0:
+            prev_item = self.table.item(idx - 1, 0)
+            prev = parse_lrc_time(prev_item.text()) if prev_item and prev_item.text().strip() else None
+            if prev is not None and sec < prev + 0.01:
+                sec = round(prev + 0.01, 2)
+        sec = round(sec, 2)
+        t_item = self.table.item(idx, 0)
+        if t_item is None:
+            return False
+        self._push_undo()
+        self.table.blockSignals(True)
+        try:
+            t_item.setText(format_lrc_time(sec))
+            t_item.setTextAlignment(Qt.AlignCenter)
+            t_item.setForeground(QBrush(QColor("#e6e6e6")))
+        finally:
+            self.table.blockSignals(False)
+        self._table_baseline = self._table_snapshot()
+        self._update_undo_buttons()
+        self._tap_index = idx + 1
+        if self._tap_index >= n:
+            # Finished the pass: keep times, switch back to normal view
+            self.set_tap_sync_enabled(False)
+            return True
+        self._update_tap_ui()
+        return True
+
+    def tap_back_one(self) -> bool:
+        """Move the tap cursor back one line (keeps stamped times)."""
+        if not getattr(self, "_tap_enabled", False):
+            return False
+        if getattr(self, "_tap_index", 0) <= 0:
+            return False
+        self._tap_index -= 1
+        self._update_tap_ui()
+        return True
+
+    def restart_tap_pass(self) -> bool:
+        """Restart the tap pass: cursor back to line 1, audio from the top.
+
+        Already-stamped times stay until re-tapped (each new tap overwrites
+        its row). Playback restarts so the new pass stays in sync.
+        """
+        if not getattr(self, "_tap_enabled", False):
+            return False
+        if self.table.rowCount() == 0:
+            return False
+        self._tap_index = 0
+        self._update_tap_ui()
+        self._ensure_tap_playback(from_top=True)
+        return True
+
+    def _tap_key_action(self, key: int) -> bool:
+        """Handle one tap-mode key. Returns True if the key was consumed."""
+        if not getattr(self, "_tap_enabled", False):
+            return False
+        if self._is_cell_editing():
+            return False
+        if key in (Qt.Key_Space, Qt.Key_T):
+            return bool(self.tap_current_line())
+        if key == Qt.Key_Backspace:
+            return bool(self.tap_back_one())
+        return False
+
+    def eventFilter(self, obj, event) -> bool:
+        # Belt-and-braces for tap keys: the table/viewport may accept Space
+        # in some styles before it reaches keyPressEvent, so intercept tap
+        # keys here too (exactly one tap: a consumed event never propagates).
+        try:
+            if (getattr(self, "_tap_enabled", False)
+                    and event.type() == QEvent.KeyPress
+                    and obj in (getattr(self, "table", None),
+                                getattr(self.table, "viewport", lambda: None)())):
+                if self._tap_key_action(int(event.key())):
+                    return True
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event) -> None:
+        # Ctrl+Z / Ctrl+Y (and Ctrl+Shift+Z) = table-level undo/redo, and
+        # while tap-sync is ON, Space/T taps and Backspace steps back —
+        # unless the user is editing a cell (then keys type / undo normally
+        # inside the cell editor and must not touch the table).
+        try:
+            editing = self._is_cell_editing()
+            if not editing:
+                mods = event.modifiers()
+                ctrl = bool(mods & Qt.ControlModifier) and not bool(mods & Qt.AltModifier)
+                k = event.key()
+                if ctrl and k == Qt.Key_Z:
+                    if bool(mods & Qt.ShiftModifier):
+                        if self.redo_table_edit():
+                            event.accept()
+                            return
+                    else:
+                        if self.undo_table_edit():
+                            event.accept()
+                            return
+                elif ctrl and k == Qt.Key_Y:
+                    if self.redo_table_edit():
+                        event.accept()
+                        return
+            if self._tap_key_action(int(event.key())):
+                event.accept()
+                return
+        except Exception:
+            pass
+        super().keyPressEvent(event)
+
     def fix_timestamps(self):
         """Manual fix: set each out-of-order (red) timestamp to just after
         the line above (previous timestamp + 0.01s). Order never changes."""
@@ -843,6 +1427,8 @@ class LyricViewerDialog(QDialog):
         n = self.table.rowCount()
         if not n:
             return
+        before = self._table_snapshot()
+        redo_backup = self._push_undo()
         self.table.blockSignals(True)
         try:
             running_max = None
@@ -862,37 +1448,59 @@ class LyricViewerDialog(QDialog):
                     running_max = s
         finally:
             self.table.blockSignals(False)
-        self._refresh_row_marking()
+        self._finish_table_mutation(before, redo_backup)
 
     # --- edit actions ---
     def add_row(self):
         from PySide6.QtGui import QBrush, QColor
         row = self.table.currentRow()
         insert_at = row + 1 if row >= 0 else self.table.rowCount()
-        self.table.insertRow(insert_at)
-        # default time = previous line + 2s (or 0)
-        last_sec = 0.0
-        if self.table.rowCount() > 1 and insert_at > 0:
-            prev = self.table.item(insert_at - 1, 0)
-            if prev:
-                last_sec = parse_lrc_time(prev.text()) or 0.0
-                last_sec += 2.0
-        t_it = QTableWidgetItem(format_lrc_time(last_sec))
-        t_it.setTextAlignment(Qt.AlignCenter)
-        t_it.setForeground(QBrush(QColor("#e6e6e6")))
-        l_it = QTableWidgetItem("")
-        l_it.setForeground(QBrush(QColor("#e6e6e6")))
-        self.table.setItem(insert_at, 0, t_it)
-        self.table.setItem(insert_at, 1, l_it)
-        self._refresh_row_marking()
+        self._push_undo()
+        self.table.blockSignals(True)
+        try:
+            self.table.insertRow(insert_at)
+            # default time = previous line + 2s (or 0)
+            last_sec = 0.0
+            if self.table.rowCount() > 1 and insert_at > 0:
+                prev = self.table.item(insert_at - 1, 0)
+                if prev:
+                    last_sec = parse_lrc_time(prev.text()) or 0.0
+                    last_sec += 2.0
+            t_it = QTableWidgetItem(format_lrc_time(last_sec))
+            t_it.setTextAlignment(Qt.AlignCenter)
+            t_it.setForeground(QBrush(QColor("#e6e6e6")))
+            l_it = QTableWidgetItem("")
+            l_it.setForeground(QBrush(QColor("#e6e6e6")))
+            self.table.setItem(insert_at, 0, t_it)
+            self.table.setItem(insert_at, 1, l_it)
+        finally:
+            self.table.blockSignals(False)
+        self._table_baseline = self._table_snapshot()
+        self._update_undo_buttons()
+        if getattr(self, "_tap_enabled", False):
+            # Keep the tap cursor valid after structural edits
+            self._tap_index = min(getattr(self, "_tap_index", 0), self.table.rowCount() - 1)
+            self._update_tap_ui()
+        else:
+            self._refresh_row_marking()
         self.table.setCurrentCell(insert_at, 1)
         self.table.edit(self.table.model().index(insert_at, 1))
 
     def remove_selected_rows(self):
         rows = sorted({idx.row() for idx in self.table.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
+        self._push_undo()
         for r in rows:
             self.table.removeRow(r)
-        self._refresh_row_marking()
+        self._table_baseline = self._table_snapshot()
+        self._update_undo_buttons()
+        if getattr(self, "_tap_enabled", False):
+            n = self.table.rowCount()
+            self._tap_index = max(0, min(getattr(self, "_tap_index", 0), max(0, n - 1) if n else 0))
+            self._update_tap_ui()
+        else:
+            self._refresh_row_marking()
 
     def _on_shift_button(self):
         ok, msg = self.shift_selected_times()
@@ -924,6 +1532,8 @@ class LyricViewerDialog(QDialog):
             return False, f"Invalid offset {offset_text!r}. Use e.g. +00:02.11 or -00:03.45."
         if offset == 0:
             return False, "Offset is zero, nothing to shift."
+        before = self._table_snapshot()
+        redo_backup = self._push_undo()
         shifted = 0
         self.table.blockSignals(True)
         try:
@@ -940,7 +1550,7 @@ class LyricViewerDialog(QDialog):
                 shifted += 1
         finally:
             self.table.blockSignals(False)
-        self._refresh_row_marking()
+        self._finish_table_mutation(before, redo_backup)
         sign = "+" if offset > 0 else "-"
         return True, f"Shifted {shifted} row(s) by {sign}{format_lrc_time(abs(offset))[1:-1]}."
 
