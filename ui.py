@@ -471,9 +471,10 @@ class LyricViewerDialog(QDialog):
         self.tap_toggle.setCheckable(True)
         self.tap_toggle.setChecked(False)
         self.tap_toggle.setToolTip(
-            "Turn tap-sync ON to re-tap timings line by line. While ON, old timestamps are ignored "
-            "(no auto-follow, no red flags, clicks move the tap cursor instead of seeking). "
-            "Playback starts from the top automatically — then press Space/T or Tap for each line."
+            "Turn tap-sync ON to re-tap timings line by line. While ON, only the playback "
+            "follow-selection ignores the old timestamps (clicks still seek, validation still "
+            "applies). Enable mid-song and keep playing from there — then press Space/T or Tap "
+            "for each line."
         )
         self.tap_toggle.setStyleSheet(
             "QPushButton:checked { background-color: #2e7d32; color: #ffffff; font-weight: bold; }"
@@ -710,9 +711,7 @@ class LyricViewerDialog(QDialog):
         self._update_undo_buttons()
         if getattr(self, "_tap_enabled", False):
             self._tap_index = 0
-            self._update_tap_ui()
-        else:
-            self._refresh_row_marking()
+        self._after_table_changed()
 
     def collect_lines(self) -> list[dict]:
         out = []
@@ -887,15 +886,15 @@ class LyricViewerDialog(QDialog):
 
     def _on_item_clicked(self, item):
         # Single click = jump to timestamp (double click still edits).
-        # While tap-sync is ON, old timestamps are ignored: a click only
-        # moves the tap cursor (no seek), so you can re-tap from any line.
+        # In tap-sync mode this still seeks normally — only the playback
+        # follow-selection ignores timestamps. The click also moves the
+        # tap cursor, so you can re-tap from any line.
         row = item.row() if item else self.table.currentRow()
         if row < 0:
             return
         if getattr(self, "_tap_enabled", False):
             self._tap_index = max(0, min(row, max(0, self.table.rowCount() - 1)))
             self._update_tap_ui()
-            return
         t_item = self.table.item(row, 0)
         if t_item is None:
             return
@@ -934,12 +933,13 @@ class LyricViewerDialog(QDialog):
     def _repaint_rows(self):
         # Paint every row: red background for out-of-sequence rows, plain
         # dark grey otherwise. No playback highlight by design.
-        # While tap-sync is ON, red marking is suppressed and the tap
-        # cursor row gets a yellow background instead.
+        # In tap-sync mode the tap cursor row additionally gets a yellow
+        # background (next line to stamp). Only the playback
+        # follow-selection ignores timestamps; validation still applies.
         from PySide6.QtGui import QBrush, QColor
         tap_on = getattr(self, "_tap_enabled", False)
         tap_idx = getattr(self, "_tap_index", 0) if tap_on else -1
-        invalid = getattr(self, "_invalid_rows", set()) if not tap_on else set()
+        invalid = getattr(self, "_invalid_rows", set())
         for r in range(self.table.rowCount()):
             for c in range(self.table.columnCount()):
                 it = self.table.item(r, c)
@@ -1002,6 +1002,18 @@ class LyricViewerDialog(QDialog):
         self._invalid_rows = invalid
         self._repaint_rows()
 
+    def _after_table_changed(self) -> None:
+        """Refresh validation (and the tap cursor, if tap-sync is ON).
+
+        Timestamps always drive validation and seeking; only the playback
+        follow-selection ignores them while tap-sync is ON.
+        """
+        self._refresh_row_marking()
+        if getattr(self, "_tap_enabled", False):
+            n = self.table.rowCount()
+            self._tap_index = max(0, min(getattr(self, "_tap_index", 0), max(0, n - 1) if n else 0))
+            self._update_tap_ui()
+
     # --- table-level undo / redo (Ctrl+Z / Ctrl+Y) ---
     def _table_snapshot(self) -> list[tuple[str, str]]:
         """Raw cell texts, row by row — restorable exactly (incl. invalid)."""
@@ -1056,12 +1068,7 @@ class LyricViewerDialog(QDialog):
             self._update_undo_buttons()
         except Exception:
             pass
-        if getattr(self, "_tap_enabled", False):
-            n = self.table.rowCount()
-            self._tap_index = max(0, min(getattr(self, "_tap_index", 0), max(0, n - 1) if n else 0))
-            self._update_tap_ui()
-        else:
-            self._refresh_row_marking()
+        self._after_table_changed()
 
     def _restore_snapshot(self, snap: list[tuple[str, str]]) -> None:
         """Replace the table content with a snapshot (undo/redo internals)."""
@@ -1086,12 +1093,7 @@ class LyricViewerDialog(QDialog):
         self._followed_row = None
         self._table_baseline = list(snap)
         self._update_undo_buttons()
-        if getattr(self, "_tap_enabled", False):
-            n = self.table.rowCount()
-            self._tap_index = max(0, min(getattr(self, "_tap_index", 0), max(0, n - 1) if n else 0))
-            self._update_tap_ui()
-        else:
-            self._refresh_row_marking()
+        self._after_table_changed()
 
     def _is_cell_editing(self) -> bool:
         """True while the in-cell editor is open (its own Ctrl+Z applies).
@@ -1164,13 +1166,13 @@ class LyricViewerDialog(QDialog):
     def set_tap_sync_enabled(self, on: bool) -> None:
         """Enable/disable tap-sync.
 
-        Not a separate mode: the table stays as-is, but while ON the old
-        timestamps are temporarily ignored (no follow, no red flags,
-        clicks move the tap cursor instead of seeking). Each tap overwrites
-        one row; untapped rows keep their old time until tapped. Turning
-        OFF keeps all tapped times and re-enables normal validation.
-        Turning ON also starts playback from the top so tapping can begin
-        immediately.
+        Not a separate mode: the table stays as-is, but while ON the
+        playback follow-selection ignores the old timestamps (otherwise it
+        would fight the tap cursor). Everything else — seeking by clicking
+        a row, validation, playback position — keeps working normally, so
+        you can enable tap-sync mid-song and keep playing from there.
+        Each tap overwrites one row; untapped rows keep their old time
+        until tapped. Turning OFF keeps all tapped times.
         """
         on = bool(on)
         self._tap_enabled = on
@@ -1199,6 +1201,8 @@ class LyricViewerDialog(QDialog):
         if on:
             # Keep Space for tapping: take focus away from buttons so the
             # key reaches the tap handler instead of triggering a button.
+            # Playback itself is left untouched — enable mid-song and keep
+            # playing from where you are.
             try:
                 for b in (self.btn_play, self.btn_stop, self.btn_tap,
                           self.btn_tap_back, self.btn_tap_restart, self.tap_toggle):
@@ -1206,8 +1210,8 @@ class LyricViewerDialog(QDialog):
                 self.table.setFocus()
             except Exception:
                 pass
+            self._refresh_row_marking()
             self._update_tap_ui()
-            self._ensure_tap_playback(from_top=True)
         else:
             try:
                 for b in (self.btn_play, self.btn_stop, self.btn_tap,
@@ -1220,11 +1224,12 @@ class LyricViewerDialog(QDialog):
             self._refresh_row_marking()
 
     def _ensure_tap_playback(self, from_top: bool = False) -> None:
-        """Start (or resume) playback for a tap pass.
+        """Start (or resume) playback, e.g. after Restart.
 
-        With from_top=True (enabling tap-sync / Restart), seeks to the
-        start first when stopped at position 0 or sitting at the end.
-        Does nothing when already playing or when no audio is loaded.
+        With from_top=True, seeks to the start first when stopped at
+        position 0 or sitting at the end. Does nothing when already
+        playing or when no audio is loaded. Merely enabling tap-sync
+        never calls this — playback stays where it is.
         """
         try:
             if self._player is None:
@@ -1334,7 +1339,7 @@ class LyricViewerDialog(QDialog):
             # Finished the pass: keep times, switch back to normal view
             self.set_tap_sync_enabled(False)
             return True
-        self._update_tap_ui()
+        self._after_table_changed()
         return True
 
     def tap_back_one(self) -> bool:
@@ -1351,15 +1356,21 @@ class LyricViewerDialog(QDialog):
         """Restart the tap pass: cursor back to line 1, audio from the top.
 
         Already-stamped times stay until re-tapped (each new tap overwrites
-        its row). Playback restarts so the new pass stays in sync.
+        its row). Unlike merely enabling tap-sync, this explicitly seeks
+        to the start and (re)starts playback for the new pass.
         """
         if not getattr(self, "_tap_enabled", False):
             return False
         if self.table.rowCount() == 0:
             return False
         self._tap_index = 0
-        self._update_tap_ui()
-        self._ensure_tap_playback(from_top=True)
+        try:
+            if self._player is not None:
+                self._player.setPosition(0)
+        except Exception:
+            pass
+        self._after_table_changed()
+        self._ensure_tap_playback(from_top=False)
         return True
 
     def _tap_key_action(self, key: int) -> bool:
@@ -1477,12 +1488,8 @@ class LyricViewerDialog(QDialog):
             self.table.blockSignals(False)
         self._table_baseline = self._table_snapshot()
         self._update_undo_buttons()
-        if getattr(self, "_tap_enabled", False):
-            # Keep the tap cursor valid after structural edits
-            self._tap_index = min(getattr(self, "_tap_index", 0), self.table.rowCount() - 1)
-            self._update_tap_ui()
-        else:
-            self._refresh_row_marking()
+        # Keep the tap cursor valid after structural edits
+        self._after_table_changed()
         self.table.setCurrentCell(insert_at, 1)
         self.table.edit(self.table.model().index(insert_at, 1))
 
@@ -1495,12 +1502,7 @@ class LyricViewerDialog(QDialog):
             self.table.removeRow(r)
         self._table_baseline = self._table_snapshot()
         self._update_undo_buttons()
-        if getattr(self, "_tap_enabled", False):
-            n = self.table.rowCount()
-            self._tap_index = max(0, min(getattr(self, "_tap_index", 0), max(0, n - 1) if n else 0))
-            self._update_tap_ui()
-        else:
-            self._refresh_row_marking()
+        self._after_table_changed()
 
     def _on_shift_button(self):
         ok, msg = self.shift_selected_times()
