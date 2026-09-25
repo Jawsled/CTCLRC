@@ -18,11 +18,11 @@ Android users should use [CTCLRC-droid](https://github.com/Kdroidwin/CTCLRCdroid
 Use the packaged Windows application:
 
 0. Build the executable.
-1. Launch the application.
+1. Launch the application (a splash screen shows while it loads).
 2. Set generation parameters (Language, by-line/charsync, embed)
 3. Configure if the application should check LRClib for existing lyrics
 4. Hit `generate`
-5. Once generated, use `View lyrics` button to check if the timings are correct. If not, you can edit the timings.
+5. Once generated, use the `Lyric Viewer / Editor` button to check if the timings are correct. If not, you can edit the timings: double-click cells to edit, `Tap-sync` to re-tap timings line by line while the song plays (`Space`/`T` per line), `Fix Timestamps` / `Shift Times` for batch corrections, and `Ctrl+Z` / `Ctrl+Y` to undo/redo.
 6. Once done, you can save edited lyrics, and optionally, you can publish them on lrclib to help others.
 
 - The generated `.lrc` file is saved in the same folder as the audio file.
@@ -104,12 +104,12 @@ If you have a local copy of the `ctc-forced-aligner` ZIP package:
 Output:
 
 ```
-dist\CTCLRC.exe
+dist\CTCLRC\CTCLRC.exe
 ```
 
 ## Important Distribution Notes
 
-Builds should use the **single-file (One-File)** PyInstaller specification:
+Builds use the **directory (One-Dir)** PyInstaller specification:
 
 ```
 .\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm CTCLRC.spec
@@ -118,12 +118,14 @@ Builds should use the **single-file (One-File)** PyInstaller specification:
 Output:
 
 ```
-dist\CTCLRC.exe
+dist\CTCLRC\CTCLRC.exe
 ```
 
-The generated executable is a single standalone file.
+The output is a folder: `CTCLRC.exe` plus its support files. The directory
+build starts much faster than a single-file build (no multi-GB unpack to a
+temp dir on every launch) and is used together with the startup splash screen.
 
-Users can move `CTCLRC.exe` to any folder and run it directly.
+Move the whole `dist\CTCLRC` folder together and run `CTCLRC.exe` from inside it.
 
 ---
 
