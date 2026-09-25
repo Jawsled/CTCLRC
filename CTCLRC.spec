@@ -112,13 +112,14 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
+# Directory (onedir) build: everything is collected once under
+# dist\CTCLRC\ at build time, so launching the app no longer unpacks a
+# ~2 GB bundle to a temp dir on every start.
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
-    exclude_binaries=False,
+    exclude_binaries=True,
     name="CTCLRC",
     debug=False,
     bootloader_ignore_signals=False,
@@ -126,4 +127,14 @@ exe = EXE(
     upx=True,
     console=False,
     icon=icon_path,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name="CTCLRC",
 )

@@ -4,12 +4,48 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtGui import QIcon
-from PySide6.QtCore import QObject, QThread, Signal, Slot, QTimer
-from PySide6.QtWidgets import QApplication, QMessageBox, QDialogButtonBox
+from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtCore import QObject, QThread, Signal, Slot, QTimer, Qt
+from PySide6.QtWidgets import QApplication, QMessageBox, QDialogButtonBox, QSplashScreen
 
-from ui import MainWindow, apply_dark_grey_theme
-from align import generate_lrc, load_alignment_bundle, detect_existing_lrc, extract_embedded_lyrics, load_lyrics_text, has_lyrics_source, get_device_info, DEVICE
+
+_HEAVY_IMPORTS_DONE = False
+
+
+def _ensure_heavy_imports():
+    """Import ui/align on first use so the splash screen can paint during startup.
+
+    Idempotent: populates module globals once. Called from main() after the
+    splash is shown, and defensively from App() for embedders/tests that
+    instantiate App without going through main().
+    """
+    global _HEAVY_IMPORTS_DONE
+    if _HEAVY_IMPORTS_DONE and "MainWindow" in globals():
+        return
+    from ui import MainWindow as _MainWindow, apply_dark_grey_theme as _apply_theme
+    from align import (
+        generate_lrc as _generate_lrc,
+        load_alignment_bundle as _load_bundle,
+        detect_existing_lrc as _detect_lrc,
+        extract_embedded_lyrics as _extract_emb,
+        load_lyrics_text as _load_txt,
+        has_lyrics_source as _has_src,
+        get_device_info as _dev_info,
+        DEVICE as _DEVICE,
+    )
+    globals().update(
+        MainWindow=_MainWindow,
+        apply_dark_grey_theme=_apply_theme,
+        generate_lrc=_generate_lrc,
+        load_alignment_bundle=_load_bundle,
+        detect_existing_lrc=_detect_lrc,
+        extract_embedded_lyrics=_extract_emb,
+        load_lyrics_text=_load_txt,
+        has_lyrics_source=_has_src,
+        get_device_info=_dev_info,
+        DEVICE=_DEVICE,
+    )
+    _HEAVY_IMPORTS_DONE = True
 
 
 def resource_path(relative_path: str) -> Path:
@@ -203,6 +239,7 @@ class LrclibPublishWorker(QObject):
 class App(QObject):
     def __init__(self):
         super().__init__()
+        _ensure_heavy_imports()
         self.window = MainWindow()
         try:
             self.device_info = get_device_info()
@@ -647,18 +684,58 @@ class App(QObject):
 
 def main():
     app = QApplication(sys.argv)
-    # Dark grey (dark mode) theme, applied app-wide regardless of OS setting
+
+    # Splash screen: boot (imports, window build) takes a while, so show
+    # that the app is alive. Never allowed to break startup — every step
+    # is guarded and the splash is closed in all paths.
+    splash = None
+    splash_path = resource_path("assets/splash.png")
     try:
-        apply_dark_grey_theme(app)
+        pixmap = QPixmap(str(splash_path))
+        if not pixmap.isNull():
+            splash = QSplashScreen(pixmap)
+            splash.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.SplashScreen)
+            splash.show()
     except Exception:
-        pass
-    icon_path = resource_path("assets/ctclrc.ico")
-    if icon_path.exists():
-        app.setWindowIcon(QIcon(str(icon_path)))
-    controller = App()
-    if icon_path.exists():
-        controller.window.setWindowIcon(QIcon(str(icon_path)))
-    controller.window.show()
+        splash = None
+
+    def stage(message: str):
+        try:
+            if splash is not None:
+                splash.showMessage(
+                    message, Qt.AlignBottom | Qt.AlignHCenter, Qt.white
+                )
+                app.processEvents()
+        except Exception:
+            pass
+
+    window = None
+    try:
+        stage("Loading libraries…")
+        _ensure_heavy_imports()
+        # Dark grey (dark mode) theme, applied app-wide regardless of OS setting
+        try:
+            apply_dark_grey_theme(app)
+        except Exception:
+            pass
+        icon_path = resource_path("assets/ctclrc.ico")
+        if icon_path.exists():
+            app.setWindowIcon(QIcon(str(icon_path)))
+        stage("Building interface…")
+        controller = App()
+        if icon_path.exists():
+            controller.window.setWindowIcon(QIcon(str(icon_path)))
+        window = controller.window
+        window.show()
+    finally:
+        try:
+            if splash is not None:
+                if window is not None:
+                    splash.finish(window)
+                else:
+                    splash.close()
+        except Exception:
+            pass
     sys.exit(app.exec())
 
 
